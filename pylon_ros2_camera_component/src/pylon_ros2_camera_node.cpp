@@ -31,6 +31,7 @@
 #include <rclcpp/logger.hpp>
 
 //#include <functional>
+#include <regex>
 
 #include "encoding_conversions.hpp"
 #include "pylon_ros2_camera_node.hpp"
@@ -82,6 +83,36 @@ PylonROS2CameraNode::PylonROS2CameraNode(const rclcpp::NodeOptions& options)
   {
     RCLCPP_INFO(LOGGER, "Camera not calibrated");
   }
+
+  // parse mask points with json format of "[[x_start, y_start, x_end, y_end], ...]"
+  std::regex outerRegex(R"((\[[\d+, ]+\]))");
+  std::regex innerRegex(R"(\[(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\])");
+  std::smatch outerMatch, innerMatch;
+  std::string s = this->pylon_camera_parameter_set_.mask_points_;
+  while (std::regex_search(s, outerMatch, outerRegex))
+  {
+    std::string sublistStr = outerMatch[1].str();
+    if (std::regex_match(sublistStr, innerMatch, innerRegex))
+    {
+      std::array<int, 4> arr = {
+          std::stoi(innerMatch[1].str()),
+          std::stoi(innerMatch[2].str()),
+          std::stoi(innerMatch[3].str()),
+          std::stoi(innerMatch[4].str())};
+      mask_regions_.push_back(arr);
+    }
+    s = outerMatch.suffix().str();
+  }
+  std::string mask_str = "";
+  for (const auto &region : mask_regions_)
+  {
+    mask_str += "[" + std::to_string(region[0]) + "," + std::to_string(region[1]) + "," + std::to_string(region[2]) + "," + std::to_string(region[3]) + "],";
+  }
+  if (!mask_str.empty())
+  {
+    mask_str = mask_str.substr(0, mask_str.size() - 1);
+  }
+  RCLCPP_INFO(LOGGER, "Parsed masks: '%s'", mask_str.c_str());
 
   // starting spinning thread
   RCLCPP_INFO_STREAM(LOGGER, "Start image grabbing if node connects to topic with a frame rate of: " << this->frameRate() << " Hz");
@@ -1049,6 +1080,27 @@ bool PylonROS2CameraNode::grabImage()
       return false;
     }
     this->img_raw_msg_.header.stamp = stamp;
+
+    if (this->pylon_camera_parameter_set_.mask_points_ != "")
+    {
+      // apply image masks by setting pixels in the region to zero
+      int bytes_per_pixel = sensor_msgs::image_encodings::bitDepth(this->img_raw_msg_.encoding) / 8;
+      for (const auto &region : mask_regions_)
+      {
+        // ensure bounds are within image dimensions
+        int min_x = std::max(0, region[0]);
+        int min_y = std::max(0, region[1]);
+        int max_x = std::min(static_cast<int>(this->img_raw_msg_.width) - 1, region[2]);
+        int max_y = std::min(static_cast<int>(this->img_raw_msg_.height) - 1, region[3]);
+
+        // set pixels to zero
+        for (int y = min_y; y <= max_y; y++)
+        {
+          uint8_t *ptr = &this->img_raw_msg_.data[y * this->img_raw_msg_.step + min_x * bytes_per_pixel];
+          memset(ptr, 0, (max_x - min_x + 1) * bytes_per_pixel);
+        }
+      }
+    }
   }
   else
   {
